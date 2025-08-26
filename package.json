@@ -1,1 +1,14 @@
-
+{
+"name": "leonina-building-door",
+"version": "1.0.0",
+"description": "Opener per Leonina building door",
+"main": "server.js",
+"type": "module",
+"scripts": {
+"start": "node server.js"
+},
+"dependencies": {
+"express": "^4.18.2",
+"axios": "^1.6.0"
+}
+}
