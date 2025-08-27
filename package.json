@@ -1,7 +1,7 @@
-{
+ {
   "name": "shelly-unified-opener",
   "version": "1.0.0",
-  "description": "Unified Shelly opener with daily tokens + diagnostics",
+  "description": "Shelly opener with v1/v2 auto-fallback + one-time tokens",
   "type": "module",
   "main": "server.js",
   "scripts": {
