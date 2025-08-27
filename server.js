@@ -8,29 +8,64 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // ====== ENV ======
-const SHELLY_API_KEY = process.env.SHELLY_API_KEY; // la tua chiave Shelly Cloud
+const SHELLY_API_KEY  = process.env.SHELLY_API_KEY; // obbligatoria
 const SHELLY_BASE_URL = process.env.SHELLY_BASE_URL || "https://shelly-api-eu.shelly.cloud";
-const TOKEN_SECRET = process.env.TOKEN_SECRET || "changeme";
-const TIMEZONE = process.env.TIMEZONE || "Europe/Rome";
+const TOKEN_SECRET    = process.env.TOKEN_SECRET || "changeme";
+const TIMEZONE        = process.env.TIMEZONE || "Europe/Rome";
+const PORT            = Number(process.env.PORT || 10000);
 
-// ====== DEVICE MAP ======
+// ====== TARGETS ======
 const TARGETS = {
-  "leonina-door": { id: "3494547a9395", name: "Leonina — Apartment Door" },
-  "leonina-building-door": { id: "34945479fbbe", name: "Leonina — Building Door" },
-  "scala-door": { id: "3494547a1075", name: "Scala — Apartment Door" },
-  "scala-building-door": { id: "3494547745ee", name: "Scala — Building Door" },
-  "ottavia-door": { id: "3494547a887d", name: "Ottavia — Apartment Door" },
-  "ottavia-building-door": { id: "3494547ab62b", name: "Ottavia — Building Door" },
-  "viale-trastevere-door": { id: "34945479fa35", name: "Viale Trastevere — Apartment Door" },
+  "leonina-door":                   { id: "3494547a9395", name: "Leonina — Apartment Door" },
+  "leonina-building-door":          { id: "34945479fbbe", name: "Leonina — Building Door" },
+  "scala-door":                     { id: "3494547a1075", name: "Scala — Apartment Door" },
+  "scala-building-door":            { id: "3494547745ee", name: "Scala — Building Door" },
+  "ottavia-door":                   { id: "3494547a887d", name: "Ottavia — Apartment Door" },
+  "ottavia-building-door":          { id: "3494547ab62b", name: "Ottavia — Building Door" },
+  "viale-trastevere-door":          { id: "34945479fa35", name: "Viale Trastevere — Apartment Door" },
   "viale-trastevere-building-door": { id: "34945479fd73", name: "Viale Trastevere — Building Door" },
-  "arenula-building-door": { id: "3494547ab05e", name: "Arenula — Building Door" }
+  "arenula-building-door":          { id: "3494547ab05e", name: "Arenula — Building Door" }
 };
 
-// Shelly 1 usa sempre relay channel 0
+// Shelly 1 => relay channel 0
 const RELAY_CHANNEL = 0;
 
-// ====== HELPER: chiamata al Cloud v1 ======
-async function cloudOpenRelay(deviceId) {
+// ====== TOKEN monouso (5 minuti) ======
+const usedTokens = new Map();
+
+function makeToken(target) {
+  const ts = Date.now();
+  const sig = crypto.createHmac("sha256", TOKEN_SECRET)
+    .update(`${target}:${ts}`)
+    .digest("base64url");
+  return { ts, sig };
+}
+
+function verifyToken(target, tsStr, sig) {
+  const expected = crypto.createHmac("sha256", TOKEN_SECRET)
+    .update(`${target}:${tsStr}`)
+    .digest("base64url");
+
+  if (sig !== expected) return { ok:false, error:"invalid_signature" };
+  const ts = Number(tsStr);
+  const age = Date.now() - ts;
+  if (!Number.isFinite(ts) || age < 0 || age > 5*60*1000) return { ok:false, error:"expired" };
+  if (usedTokens.has(sig)) return { ok:false, error:"already_used" };
+
+  usedTokens.set(sig, ts + 5*60*1000);
+  return { ok:true };
+}
+
+// pulizia token scaduti
+setInterval(() => {
+  const now = Date.now();
+  for (const [sig, exp] of usedTokens.entries()) if (exp < now) usedTokens.delete(sig);
+}, 60_000);
+
+// ====== Chiamate Shelly Cloud ======
+
+// v1: /device/relay/control  (Gen1)
+async function shellyV1_On(deviceId) {
   const url = `${SHELLY_BASE_URL}/device/relay/control`;
   const form = new URLSearchParams({
     id: deviceId,
@@ -38,150 +73,116 @@ async function cloudOpenRelay(deviceId) {
     channel: String(RELAY_CHANNEL),
     turn: "on"
   });
+  const { data, status } = await axios.post(url, form.toString(), {
+    headers: { "Content-Type":"application/x-www-form-urlencoded" },
+    timeout: 10000
+  });
+  if (data?.isok) return { ok:true, data, api:"v1" };
+  const err = new Error("v1_failed");
+  err.status = status;
+  err.payload = data;
+  throw err;
+}
+
+// v2 RPC: /device/rpc  (Plus/Gen2)
+async function shellyV2_On(deviceId) {
+  const url = `${SHELLY_BASE_URL}/device/rpc`;
+  const body = {
+    id: deviceId,
+    auth_key: SHELLY_API_KEY,
+    method: "Switch.Set",
+    params: { id: 0, on: true }
+  };
+  const { data, status } = await axios.post(url, body, { timeout: 10000 });
+  // le risposte v2 tipicamente non hanno isok; se non c'è errore HTTP consideriamo ok
+  if (status >= 200 && status < 300) return { ok:true, data, api:"v2" };
+  const err = new Error("v2_failed");
+  err.status = status;
+  err.payload = data;
+  throw err;
+}
+
+// tenta v1, se "wrong_type"/simili prova v2
+async function openTarget(targetKey) {
+  if (!SHELLY_API_KEY) return { ok:false, error:"missing_api_key" };
+  const t = TARGETS[targetKey];
+  if (!t) return { ok:false, error:"unknown_target" };
 
   try {
-    const { data } = await axios.post(url, form.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 10000
-    });
-    if (data && data.isok) return { ok: true, data };
-    return { ok: false, error: data || { message: "cloud_isok_false" } };
-  } catch (err) {
-    return {
-      ok: false,
-      error: "cloud_error",
-      details: err.response ? { status: err.response.status, data: err.response.data } : String(err)
-    };
+    const r1 = await shellyV1_On(t.id);
+    return r1;
+  } catch (e) {
+    const msg = JSON.stringify(e?.payload || {});
+    const looksWrongType = msg.includes("wrong_type") || msg.includes("Could not control this device type");
+    const unauthorized = (e?.status === 401);
+    if (!looksWrongType && !unauthorized) {
+      return { ok:false, step:"v1", error:"cloud_error", details:{ status:e?.status, data:e?.payload } };
+    }
+    // fallback a v2
+    try {
+      const r2 = await shellyV2_On(t.id);
+      return r2;
+    } catch (e2) {
+      return { ok:false, step:"v2", error:"cloud_error", details:{ status:e2?.status, data:e2?.payload } };
+    }
   }
 }
 
-// ====== TOKEN GIORNALIERO ======
-function tokenFor(target, dateStr) {
-  const payload = `${target}:${dateStr}`;
-  return crypto.createHmac("sha256", TOKEN_SECRET).update(payload).digest("base64url");
-}
-
-function todayISO() {
-  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" });
-  const [{ value: y }, , { value: m }, , { value: d }] = fmt.formatToParts(new Date());
-  return `${y}-${m}-${d}`;
-}
-
 // ====== ROUTES ======
-app.get("/", (req, res) => {
-  const rows = Object.entries(TARGETS)
-    .map(([key, v]) => {
-      return `<li>
-        <b>${key}</b> — ${v.name}
-        &nbsp; <a href="/gen/${key}">gen token</a>
-        &nbsp; <a href="/open?target=${key}">test open</a>
-        &nbsp; <a href="/test-open-token?target=${key}">test open (token)</a>
-        &nbsp; <a href="/t/${key}">smart link</a>
-      </li>`;
-    })
-    .join("\n");
 
-  res.type("html").send(
-    `<h1>Shelly unified opener</h1>
-     <p>${Object.keys(TARGETS).length} targets configured. TZ=${TIMEZONE}</p>
-     <ul>${rows}</ul>
-     <p><a href="/health">/health</a></p>`
-  );
+// Home con link di test
+app.get("/", (req, res) => {
+  const list = Object.entries(TARGETS).map(([k, v]) =>
+    `<li><b>${k}</b> — ${v.name}
+       · <a href="/t/${k}">smart link</a>
+       · <a href="/open?target=${k}">test open</a>
+       · <a href="/test-open-token?target=${k}">test open (token)</a>
+     </li>`).join("\n");
+  res.type("html").send(`<h1>Shelly unified opener</h1>
+  <p>${Object.keys(TARGETS).length} targets · TZ=${TIMEZONE}</p>
+  <ul>${list}</ul>
+  <p><a href="/health">/health</a></p>`);
 });
 
 // Health
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasApiKey: !!SHELLY_API_KEY,
-    hasBase: !!SHELLY_BASE_URL,
-    timezone: TIMEZONE,
-    today: todayISO(),
-    node: process.version
-  });
+  res.json({ ok:true, hasApiKey: !!SHELLY_API_KEY, base:SHELLY_BASE_URL, tz: TIMEZONE, node: process.version });
 });
 
-// Genera token giornaliero
-app.get("/gen/:target", (req, res) => {
-  const target = req.params.target;
-  if (!TARGETS[target]) return res.json({ ok: false, error: "unknown_target" });
-
-  const date = todayISO();
-  const sig = tokenFor(target, date);
-  const url = `${req.protocol}://${req.get("host")}/open/${target}/${date}/${sig}`;
-  res.json({ ok: true, target, date, sig, url });
-});
-
-// Apertura senza token (debug)
+// test senza token
 app.get("/open", async (req, res) => {
-  const target = req.query.target;
-  if (!TARGETS[target]) return res.json({ ok: false, error: "unknown_target" });
-  const deviceId = TARGETS[target].id;
-  const out = await cloudOpenRelay(deviceId);
-  res.json(out);
+  const key = req.query.target;
+  const out = await openTarget(key);
+  res.status(out.ok ? 200 : 400).json(out);
 });
 
-// Apertura con token
-app.get("/open/:target/:date/:sig", async (req, res) => {
-  const { target, date, sig } = req.params;
-  if (!TARGETS[target]) return res.json({ ok: false, error: "unknown_target" });
-
-  const expected = tokenFor(target, date);
-  if (sig !== expected) return res.json({ ok: false, error: "invalid_token" });
-
-  if (date !== todayISO()) return res.json({ ok: false, error: "expired_or_wrong_date" });
-
-  const deviceId = TARGETS[target].id;
-  const out = await cloudOpenRelay(deviceId);
-  res.json(out);
-});
-
-// Test token (senza aprire)
-app.get("/test-open-token", (req, res) => {
-  const target = req.query.target;
-  if (!TARGETS[target]) return res.json({ ok: false, error: "unknown_target" });
-
-  const date = todayISO();
-  const sig = tokenFor(target, date);
-  const url = `${req.protocol}://${req.get("host")}/open/${target}/${date}/${sig}`;
-  res.json({ ok: true, target, date, sig, url });
-});
-
-// Smart redirect
+// smart link (crea token e redirect)
 app.get("/t/:target", (req, res) => {
-  const target = req.params.target;
-  if (!TARGETS[target]) return res.status(404).send("unknown_target");
-  const date = todayISO();
-  const sig = tokenFor(target, date);
-  res.redirect(302, `/open/${target}/${date}/${sig}`);
+  const key = req.params.target;
+  if (!TARGETS[key]) return res.status(404).send("unknown_target");
+  const { ts, sig } = makeToken(key);
+  res.redirect(302, `/open/${encodeURIComponent(key)}/${ts}/${encodeURIComponent(sig)}`);
 });
 
-// Diagnostica
-app.get("/diag/:id", async (req, res) => {
-  const deviceId = req.params.id;
-  try {
-    const url = `${SHELLY_BASE_URL}/device/status`;
-    const form = new URLSearchParams({
-      id: deviceId,
-      auth_key: SHELLY_API_KEY
-    });
-
-    const { data } = await axios.post(url, form.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }
-    });
-
-    res.json({ ok: true, deviceId, data });
-  } catch (err) {
-    res.json({
-      ok: false,
-      error: "diag_failed",
-      details: err.response ? err.response.data : String(err)
-    });
-  }
+// apertura con token
+app.get("/open/:target/:ts/:sig", async (req, res) => {
+  const { target, ts, sig } = req.params;
+  if (!TARGETS[target]) return res.json({ ok:false, error:"unknown_target" });
+  const check = verifyToken(target, ts, sig);
+  if (!check.ok) return res.status(401).json(check);
+  const out = await openTarget(target);
+  res.status(out.ok ? 200 : 400).json(out);
 });
 
-// START
-const PORT = process.env.PORT || 10000;
+// tool: mostra link tokenizzato senza aprire
+app.get("/test-open-token", (req, res) => {
+  const key = req.query.target;
+  if (!TARGETS[key]) return res.json({ ok:false, error:"unknown_target" });
+  const { ts, sig } = makeToken(key);
+  const url = `${req.protocol}://${req.get("host")}/open/${key}/${ts}/${sig}`;
+  res.json({ ok:true, url, ts, sig, target:key });
+});
+
 app.listen(PORT, () => {
   console.log("Server listening on", PORT, "TZ:", TIMEZONE);
 });
